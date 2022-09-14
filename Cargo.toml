@@ -6,3 +6,4 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0.62"
 bytes = "1.2.1"
+sha2 = "0.10.5"

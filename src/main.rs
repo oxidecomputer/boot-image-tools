@@ -1,18 +1,15 @@
-use std::{
-    io::{Read, Seek},
-    path::PathBuf,
-    str::FromStr,
-};
+use std::{os::unix::prelude::FileExt, path::PathBuf, str::FromStr};
 
 use anyhow::{anyhow, bail, Result};
 use bytes::{Buf, BufMut};
+use sha2::Digest;
 
 mod dlpi;
 
 enum Message {
     Hello(String),
-    Offer(u64),
-    Read { offset: u64, length: u64 },
+    Offer(u64, u64, [u8; 32]),
+    Read(Vec<u64>),
     Data(u64, Vec<u8>),
     Finished,
     Reset,
@@ -45,7 +42,7 @@ impl TryFrom<&dlpi::Frame> for Message {
         }
         let typecode = data.get_u32().try_into().unwrap();
         let len = data.get_u32().try_into().unwrap();
-        if data.remaining() != len {
+        if len >= 34 && data.remaining() != len {
             bail!(
                 "payload length {} not the expected {}",
                 data.remaining(),
@@ -61,16 +58,25 @@ impl TryFrom<&dlpi::Frame> for Message {
                 Ok(Message::Hello(msg))
             }
             JMCBOOT_TYPE_READ => {
-                if data.remaining() != 2 * 8 {
+                if data.remaining() < 8 {
+                    bail!("payload too short ({})", data.remaining());
+                }
+                let count = data.get_u64();
+                if count > 160 {
+                    bail!("too many slots ({})", count);
+                }
+                if data.remaining() < (count as usize) * 8 {
                     bail!(
                         "payload length {} should have been {}",
                         data.remaining(),
-                        16
+                        count * 8,
                     );
                 }
-                let offset = data.get_u64();
-                let length = data.get_u64();
-                Ok(Message::Read { offset, length })
+                let mut offsets = Vec::new();
+                for _ in 0..count {
+                    offsets.push(data.get_u64());
+                }
+                Ok(Message::Read(offsets))
             }
             JMCBOOT_TYPE_FINISHED => Ok(Message::Finished),
             other => {
@@ -83,12 +89,16 @@ impl TryFrom<&dlpi::Frame> for Message {
 impl Message {
     fn pack(&self) -> Result<Vec<u8>> {
         match self {
-            Message::Offer(size) => {
+            Message::Offer(size, data_size, sha256) => {
                 let mut buf = Vec::new();
                 buf.put_u32(MAGIC);
                 buf.put_u32(JMCBOOT_TYPE_OFFER);
-                buf.put_u32(8);
+                buf.put_u32(2 * 8 + 32);
                 buf.put_u64(*size);
+                buf.put_u64(*data_size);
+                for b in sha256.iter() {
+                    buf.put_u8(*b);
+                }
                 Ok(buf)
             }
             Message::Data(offset, data) => {
@@ -116,6 +126,30 @@ impl Message {
     }
 }
 
+fn file_sha256(f: &std::fs::File) -> Result<[u8; 32]> {
+    let len = f.metadata()?.len();
+    let mut sum = sha2::Sha256::new();
+
+    let mut total: usize = 0;
+    let mut buf = vec![0u8; 128 * 1024];
+    loop {
+        let sz: usize =
+            f.read_at(&mut buf, total.try_into().unwrap())?.try_into().unwrap();
+        if sz == 0 {
+            break;
+        }
+        sum.update(&buf[0..sz]);
+        total += sz;
+    }
+
+    if total != len.try_into().unwrap() {
+        bail!("file changed size during checksum {} != {}", total, len);
+    }
+
+    let res = sum.finalize();
+    Ok(res.into())
+}
+
 fn main() -> Result<()> {
     let linkname =
         std::env::args().nth(1).ok_or_else(|| anyhow!("what link name?"))?;
@@ -127,6 +161,8 @@ fn main() -> Result<()> {
             .nth(3)
             .ok_or_else(|| anyhow!("system MAC address?"))?,
     )?;
+    let disksize =
+        std::env::args().nth(4).map(|s| s.parse::<u64>()).transpose()?;
 
     println!("boot server starting on link {}...\n", linkname);
 
@@ -174,15 +210,20 @@ fn main() -> Result<()> {
                     match std::fs::File::open(&filename) {
                         Ok(f) => match f.metadata() {
                             Ok(md) => {
+                                let sha = file_sha256(&f)?;
                                 file = Some(f);
+                                let len = disksize.unwrap_or(md.len());
                                 println!(
-                                    "opened file {:?}, size {}",
+                                    "opened file {:?}, size {}, target len {}",
                                     filename,
-                                    md.len()
+                                    md.len(),
+                                    len,
                                 );
                                 dl.send(
                                     macaddr,
-                                    &Message::Offer(md.len()).pack().unwrap(),
+                                    &Message::Offer(len, md.len(), sha)
+                                        .pack()
+                                        .unwrap(),
                                 )?;
                             }
                             Err(e) => {
@@ -198,40 +239,49 @@ fn main() -> Result<()> {
                         }
                     }
                 }
-                Message::Read { offset, mut length } => {
-                    let msg = if let Some(ff) = &mut file {
-                        if length > 1024 {
-                            length = 1024;
-                        }
-                        let mut buf = vec![0u8; length.try_into().unwrap()];
+                Message::Read(offsets) => {
+                    if let Some(ff) = &mut file {
+                        for offset in offsets {
+                            let mut buf = vec![0u8; 1024];
 
-                        if let Err(e) =
-                            ff.seek(std::io::SeekFrom::Start(offset))
-                        {
-                            println!("seek {} error: {:?}", offset, e);
-                            file = None;
-                            Message::Reset
-                        } else {
-                            match ff.read(&mut buf) {
+                            /*
+                             * XXX short reads?
+                             */
+                            match ff.read_at(&mut buf, offset) {
                                 Ok(sz) => {
+                                    if sz < 1024 {
+                                        println!(
+                                            "short read {} at offset {}",
+                                            sz, offset,
+                                        );
+                                    }
                                     buf.truncate(sz);
-                                    Message::Data(offset, buf)
+                                    dl.send(
+                                        macaddr,
+                                        &Message::Data(offset, buf)
+                                            .pack()
+                                            .unwrap(),
+                                    )?;
                                 }
                                 Err(e) => {
                                     println!("read {} error: {:?}", offset, e);
                                     file = None;
-                                    Message::Reset
+                                    dl.send(
+                                        macaddr,
+                                        &Message::Reset.pack().unwrap(),
+                                    )?;
+                                    break;
                                 }
                             }
                         }
                     } else {
                         /*
-                         * File not open implies we missed the Hello, and should
-                         * reset the boot process.
+                         * File not open implies we missed the Hello, and
+                         * should reset the boot process.
                          */
-                        Message::Reset
-                    };
-                    dl.send(macaddr, &msg.pack().unwrap())?;
+                        println!("read without open file; reset!");
+                        dl.send(macaddr, &Message::Reset.pack().unwrap())?;
+                    }
                 }
                 Message::Finished => {
                     println!(
