@@ -253,12 +253,14 @@ impl Dlpi {
 
     pub fn send(&mut self, dst: Address, data: &[u8]) -> Result<()> {
         let r = unsafe {
-            dlpi_send(self.handle,
+            dlpi_send(
+                self.handle,
                 dst.addr.as_ptr() as *const c_void,
                 dst.addr.len(),
                 data.as_ptr() as *const c_void,
                 data.len(),
-                std::ptr::null())
+                std::ptr::null(),
+            )
         };
         if r != DLPI_SUCCESS {
             bail!("send failed ({})", r);

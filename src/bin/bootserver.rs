@@ -1,18 +1,56 @@
-use std::{os::unix::prelude::FileExt, path::PathBuf, str::FromStr};
+use std::{
+    os::unix::prelude::FileExt,
+    path::{Path, PathBuf},
+    str::FromStr,
+};
 
 use anyhow::{anyhow, bail, Result};
 use bytes::{Buf, BufMut};
-use sha2::Digest;
 
-mod dlpi;
+use bootserver::{diskimage, dlpi};
 
 enum Message {
     Hello(String),
-    Offer(u64, u64, [u8; 32]),
+    Offer(u64, u64, [u8; 32], String),
     Read(Vec<u64>),
     Data(u64, Vec<u8>),
     Finished,
     Reset,
+}
+
+struct Image {
+    header: diskimage::Header,
+    file: std::fs::File,
+}
+
+impl Image {
+    fn open<P: AsRef<Path>>(path: P) -> Result<Image> {
+        let path = path.as_ref();
+        let file = std::fs::File::open(path)?;
+        let mut hdr = vec![0u8; diskimage::DISK_HEADER_LENGTH];
+        file.read_exact_at(&mut hdr, 0)?;
+        let header = diskimage::Header::from_bytes(&hdr)?;
+        Ok(Image { header, file })
+    }
+}
+
+impl std::fmt::Display for Image {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let sum = self
+            .header
+            .sha256
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<String>();
+        write!(
+            f,
+            "image (size {}, target size {}, hash {}, dataset {})",
+            self.header.image_size,
+            self.header.target_size,
+            sum,
+            self.header.dataset_name,
+        )
+    }
 }
 
 const MAGIC: u32 = 0x1DE12345;
@@ -89,15 +127,25 @@ impl TryFrom<&dlpi::Frame> for Message {
 impl Message {
     fn pack(&self) -> Result<Vec<u8>> {
         match self {
-            Message::Offer(size, data_size, sha256) => {
+            Message::Offer(size, data_size, sha256, dataset) => {
                 let mut buf = Vec::new();
                 buf.put_u32(MAGIC);
                 buf.put_u32(JMCBOOT_TYPE_OFFER);
-                buf.put_u32(2 * 8 + 32);
+                buf.put_u32(2 * 8 + 32 + 128);
                 buf.put_u64(*size);
                 buf.put_u64(*data_size);
                 for b in sha256.iter() {
                     buf.put_u8(*b);
+                }
+                let sz = dataset.as_bytes().len();
+                if sz > 127 {
+                    bail!("dataset name is too long ({} > 127)", sz);
+                }
+                for b in dataset.as_bytes() {
+                    buf.put_u8(*b);
+                }
+                for _ in 0..(128 - sz) {
+                    buf.put_u8(0);
                 }
                 Ok(buf)
             }
@@ -126,30 +174,6 @@ impl Message {
     }
 }
 
-fn file_sha256(f: &std::fs::File) -> Result<[u8; 32]> {
-    let len = f.metadata()?.len();
-    let mut sum = sha2::Sha256::new();
-
-    let mut total: usize = 0;
-    let mut buf = vec![0u8; 128 * 1024];
-    loop {
-        let sz: usize =
-            f.read_at(&mut buf, total.try_into().unwrap())?.try_into().unwrap();
-        if sz == 0 {
-            break;
-        }
-        sum.update(&buf[0..sz]);
-        total += sz;
-    }
-
-    if total != len.try_into().unwrap() {
-        bail!("file changed size during checksum {} != {}", total, len);
-    }
-
-    let res = sum.finalize();
-    Ok(res.into())
-}
-
 fn main() -> Result<()> {
     let linkname =
         std::env::args().nth(1).ok_or_else(|| anyhow!("what link name?"))?;
@@ -161,8 +185,6 @@ fn main() -> Result<()> {
             .nth(3)
             .ok_or_else(|| anyhow!("system MAC address?"))?,
     )?;
-    let disksize =
-        std::env::args().nth(4).map(|s| s.parse::<u64>()).transpose()?;
 
     println!("boot server starting on link {}...\n", linkname);
 
@@ -207,32 +229,22 @@ fn main() -> Result<()> {
                      * have available.  If we cannot open the ramdisk file we'll
                      * just drop the request for now.
                      */
-                    match std::fs::File::open(&filename) {
-                        Ok(f) => match f.metadata() {
-                            Ok(md) => {
-                                let sha = file_sha256(&f)?;
-                                file = Some(f);
-                                let len = disksize.unwrap_or(md.len());
-                                println!(
-                                    "opened file {:?}, size {}, target len {}",
-                                    filename,
-                                    md.len(),
-                                    len,
-                                );
-                                dl.send(
-                                    macaddr,
-                                    &Message::Offer(len, md.len(), sha)
-                                        .pack()
-                                        .unwrap(),
-                                )?;
-                            }
-                            Err(e) => {
-                                println!(
-                                    "failed to stat {:?}: {:?}",
-                                    filename, e
-                                );
-                            }
-                        },
+                    match Image::open(&filename) {
+                        Ok(img) => {
+                            println!("opened image {:?}: {}", filename, img);
+                            dl.send(
+                                macaddr,
+                                &Message::Offer(
+                                    img.header.target_size,
+                                    img.header.image_size,
+                                    img.header.sha256,
+                                    img.header.dataset_name.to_string(),
+                                )
+                                .pack()
+                                .unwrap(),
+                            )?;
+                            file = Some(img);
+                        }
                         Err(e) => {
                             file = None;
                             println!("failed to open {:?}: {:?}", filename, e);
@@ -240,14 +252,21 @@ fn main() -> Result<()> {
                     }
                 }
                 Message::Read(offsets) => {
-                    if let Some(ff) = &mut file {
+                    if let Some(img) = &mut file {
                         for offset in offsets {
                             let mut buf = vec![0u8; 1024];
+                            let fileoffset = offset
+                                .checked_add(
+                                    diskimage::DISK_HEADER_LENGTH
+                                        .try_into()
+                                        .unwrap(),
+                                )
+                                .unwrap();
 
                             /*
                              * XXX short reads?
                              */
-                            match ff.read_at(&mut buf, offset) {
+                            match img.file.read_at(&mut buf, fileoffset) {
                                 Ok(sz) => {
                                     if sz < 1024 {
                                         println!(
