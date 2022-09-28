@@ -9,6 +9,7 @@ fn main() -> Result<()> {
     let mut opts = getopts::Options::new();
     opts.reqopt("i", "", "input raw image file", "RAW");
     opts.reqopt("o", "", "output image file with header", "IMAGE");
+    opts.optopt("O", "", "output boot_image_csum file", "CSUM_FILE");
 
     let a = opts.parse(std::env::args().skip(1))?;
 
@@ -53,6 +54,17 @@ fn main() -> Result<()> {
     fo.write_all_at(&hb, 0)?;
 
     println!("ok, image written!");
+
+    if let Some(path) = a.opt_str("O") {
+        let fo = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&path)?;
+
+        fo.write_all_at(&h.sha256, 0)?;
+        println!("ok, boot_image_csum file written!");
+    }
 
     Ok(())
 }
