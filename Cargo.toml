@@ -6,5 +6,7 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0.62"
 bytes = "1.2.1"
+#dlpi = { git = "https://github.com/oxidecomputer/dlpi-sys", version = "0.1.0" }
+libdlpi-sys = { path = "/ws/dlpi-sys/libdlpi-sys" }
 getopts = "0.2.21"
 sha2 = "0.10.5"

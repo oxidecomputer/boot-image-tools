@@ -1,95 +1,14 @@
 #![allow(non_camel_case_types)]
 #![allow(dead_code)]
 
+use libdlpi_sys::*;
+
 use anyhow::{bail, Result};
 use std::{
     ffi::CString,
-    os::raw::{c_char, c_int, c_uchar, c_uint, c_void},
+    os::raw::{c_uint, c_void},
     str::FromStr,
 };
-
-enum dlpi_handle_t {}
-
-const DLPI_PHYSADDR_MAX: usize = 64;
-
-const DL_SYSERR: c_int = 0x04;
-
-const DLPI_SUCCESS: c_int = 10000; /* DLPI operation succeeded */
-const DLPI_EINVAL: c_int = 10001; /* invalid argument */
-const DLPI_ELINKNAMEINVAL: c_int = 10002; /* invalid DLPI linkname */
-const DLPI_ENOLINK: c_int = 10003; /* DLPI link does not exist */
-const DLPI_EBADLINK: c_int = 10004; /* bad DLPI link */
-const DLPI_EINHANDLE: c_int = 10005; /* invalid DLPI handle */
-const DLPI_ETIMEDOUT: c_int = 10006; /* DLPI operation timed out */
-const DLPI_EVERNOTSUP: c_int = 10007; /* unsupported DLPI Version */
-const DLPI_EMODENOTSUP: c_int = 10008; /* unsupported DLPI connection mode */
-const DLPI_EUNAVAILSAP: c_int = 10009; /* unavailable DLPI SAP */
-const DLPI_FAILURE: c_int = 10010; /* DLPI operation failed */
-const DLPI_ENOTSTYLE2: c_int = 10011; /* DLPI style-2 node reports style-1 */
-const DLPI_EBADMSG: c_int = 10012; /* bad DLPI message */
-const DLPI_ERAWNOTSUP: c_int = 10013; /* DLPI raw mode not supported */
-const DLPI_ENOTEINVAL: c_int = 10014; /* invalid DLPI notification type */
-const DLPI_ENOTENOTSUP: c_int = 10015; /* DLPI notif. not supported by link */
-const DLPI_ENOTEIDINVAL: c_int = 10016; /* invalid DLPI notification id */
-const DLPI_EIPNETINFONOTSUP: c_int = 10017; /* DLPI_IPNETINFO not supported */
-
-#[repr(C)]
-struct dlpi_recvinfo_t {
-    dri_destaddr: [c_uchar; DLPI_PHYSADDR_MAX],
-    dri_destaddrlen: c_uchar,
-    dri_destaddrtype: c_uint,
-    dri_totmsglen: usize,
-}
-
-#[repr(C)]
-struct dlpi_sendinfo_t {
-    dsi_sap: c_uint,
-    dsi_prio: dl_priority_t,
-}
-
-#[repr(C)]
-struct dl_priority_t {
-    dl_min: i32,
-    dl_max: i32,
-}
-
-#[repr(C)]
-enum dlpi_addrtype_t {
-    DLPI_ADDRTYPE_UNICAST,
-    DLPI_ADDRTYPE_GROUP,
-}
-
-#[link(name = "dlpi")]
-extern "C" {
-    fn dlpi_open(
-        linkname: *const c_char,
-        dhp: *mut *mut dlpi_handle_t,
-        flags: c_uint,
-    ) -> c_int;
-    fn dlpi_close(dhp: *mut dlpi_handle_t);
-    fn dlpi_bind(
-        dhp: *mut dlpi_handle_t,
-        sap: c_uint,
-        boundsap: *mut c_uint,
-    ) -> c_int;
-    fn dlpi_recv(
-        dhp: *mut dlpi_handle_t,
-        saddrp: *mut c_void,
-        saddrlenp: *mut usize,
-        msgbuf: *mut c_void,
-        msglenp: *mut usize,
-        msec: c_int,
-        recvp: *mut dlpi_recvinfo_t,
-    ) -> c_int;
-    fn dlpi_send(
-        dhp: *mut dlpi_handle_t,
-        daddrp: *const c_void,
-        daddrlen: usize,
-        msgbuf: *const c_void,
-        msglen: usize,
-        sendp: *const dlpi_sendinfo_t,
-    ) -> c_int;
-}
 
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
 pub struct Address {

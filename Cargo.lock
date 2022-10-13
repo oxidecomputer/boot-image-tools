@@ -24,6 +24,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "getopts",
+ "libdlpi-sys",
  "sha2",
 ]
 
@@ -92,6 +93,10 @@ name = "libc"
 version = "0.2.132"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8371e4e5341c3a96db127eb2465ac681ced4c433e01dd0e938adbef26ba93ba5"
+
+[[package]]
+name = "libdlpi-sys"
+version = "0.1.0"
 
 [[package]]
 name = "sha2"
