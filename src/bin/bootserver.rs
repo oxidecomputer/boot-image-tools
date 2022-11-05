@@ -1,10 +1,11 @@
 use std::{
+    io::Write,
     os::unix::prelude::FileExt,
     path::{Path, PathBuf},
     str::FromStr,
 };
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{bail, Result};
 use bytes::{Buf, BufMut};
 
 use bootserver::{diskimage, dlpi};
@@ -175,25 +176,99 @@ impl Message {
 }
 
 fn main() -> Result<()> {
-    let linkname =
-        std::env::args().nth(1).ok_or_else(|| anyhow!("what link name?"))?;
-    let filename = PathBuf::from(
-        &std::env::args().nth(2).ok_or_else(|| anyhow!("ramdisk filename"))?,
-    );
-    let macaddr = dlpi::Address::from_str(
-        &std::env::args()
-            .nth(3)
-            .ok_or_else(|| anyhow!("system MAC address?"))?,
-    )?;
+    let mut opts = getopts::Options::new();
+    opts.parsing_style(getopts::ParsingStyle::StopAtFirstFree);
+    opts.optflag("", "help", "usage information");
+    opts.optflag("s", "", "exit after a single boot has been completed");
+
+    let prog = "bootserver";
+    let usage = |err: Option<&str>| {
+        let mut top = opts.short_usage(prog);
+        top += " LINK_NAME IMAGE_FILE MAC_ADDRESS";
+        if let Some(err) = err {
+            eprintln!("{}\nERROR: {}", top.trim(), err);
+        } else {
+            println!("{}", opts.usage(top.trim()));
+        }
+    };
+    let a = match opts.parse(std::env::args().skip(1)) {
+        Ok(a) if a.free.len() <= 3 => {
+            if a.opt_present("help") {
+                usage(None);
+                return Ok(());
+            }
+            a
+        }
+        Ok(_) => {
+            usage(Some("unexpected arguments"));
+            std::process::exit(1);
+        }
+        Err(e) => {
+            usage(Some(&e.to_string()));
+            std::process::exit(1);
+        }
+    };
+
+    let Some(linkname) = a.free.get(0) else {
+        usage(Some("specify link name; e.g., axf0"));
+        std::process::exit(1);
+    };
+    let filename = if let Some(filename) = a.free.get(1) {
+        PathBuf::from(filename)
+    } else {
+        usage(Some("specify ramdisk image file name"));
+        std::process::exit(1);
+    };
+    let macaddr = if let Some(macaddr) = a.free.get(2) {
+        match dlpi::Address::from_str(macaddr) {
+            Ok(addr) => addr,
+            Err(e) => {
+                usage(Some(&format!("MAC address not valid: {}", e)));
+                std::process::exit(1);
+            }
+        }
+    } else {
+        usage(Some("specify MAC address of target system"));
+        std::process::exit(1);
+    };
+
+    let one_boot_only = a.opt_present("s");
+    let one_boot_check = || -> Result<()> {
+        if one_boot_only {
+            bail!("failures are fatal in one-boot mode");
+        } else {
+            Ok(())
+        }
+    };
 
     println!("boot server starting on link {}...\n", linkname);
 
     let mut dl = dlpi::Dlpi::open(&linkname)?;
     dl.bind_ethertype(0x1DE0)?;
 
-    let mut file = None;
+    let mut file: Option<Image> = None;
+    let mut last_read_status = std::time::Instant::now();
+    let mut last_read_offset: Option<u64> = None;
 
     loop {
+        let now = std::time::Instant::now();
+        if let Some(img) = &file {
+            if now.checked_duration_since(last_read_status).unwrap().as_secs()
+                > 1
+            {
+                if let Some(last_read_offset) = last_read_offset {
+                    let pct = 100 * last_read_offset / img.header.image_size;
+
+                    print!(
+                        "\rprogress: sent up to offset {} ({}%)",
+                        last_read_offset, pct,
+                    );
+                    std::io::stdout().flush().unwrap();
+                    last_read_status = std::time::Instant::now();
+                }
+            }
+        }
+
         if let Some(frame) = dl.recv(Some(1000))? {
             if frame.src() != Some(macaddr) {
                 println!(
@@ -244,10 +319,13 @@ fn main() -> Result<()> {
                                 .unwrap(),
                             )?;
                             file = Some(img);
+                            last_read_status = std::time::Instant::now();
+                            last_read_offset = None;
                         }
                         Err(e) => {
                             file = None;
                             println!("failed to open {:?}: {:?}", filename, e);
+                            one_boot_check()?;
                         }
                     }
                 }
@@ -262,6 +340,13 @@ fn main() -> Result<()> {
                                         .unwrap(),
                                 )
                                 .unwrap();
+
+                            last_read_offset =
+                                Some(if let Some(last) = last_read_offset {
+                                    last.max(offset)
+                                } else {
+                                    offset
+                                });
 
                             /*
                              * XXX short reads?
@@ -289,6 +374,7 @@ fn main() -> Result<()> {
                                         macaddr,
                                         &Message::Reset.pack().unwrap(),
                                     )?;
+                                    one_boot_check()?;
                                     break;
                                 }
                             }
@@ -300,6 +386,7 @@ fn main() -> Result<()> {
                          */
                         println!("read without open file; reset!");
                         dl.send(macaddr, &Message::Reset.pack().unwrap())?;
+                        one_boot_check()?;
                     }
                 }
                 Message::Finished => {
@@ -312,6 +399,10 @@ fn main() -> Result<()> {
 
                     file = None;
                     println!("finished copying!");
+
+                    if one_boot_only {
+                        return Ok(());
+                    }
                 }
                 _ => {}
             }
