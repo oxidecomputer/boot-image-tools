@@ -219,12 +219,16 @@ fn main() -> Result<()> {
         usage(Some("specify ramdisk image file name"));
         std::process::exit(1);
     };
-    let macaddr = if let Some(macaddr) = a.free.get(2) {
-        match dlpi::Address::from_str(macaddr) {
-            Ok(addr) => addr,
-            Err(e) => {
-                usage(Some(&format!("MAC address not valid: {}", e)));
-                std::process::exit(1);
+    let mut macaddr = if let Some(macaddr) = a.free.get(2) {
+        if macaddr == "any" {
+            None
+        } else {
+            match dlpi::Address::from_str(macaddr) {
+                Ok(addr) => Some(addr),
+                Err(e) => {
+                    usage(Some(&format!("MAC address not valid: {}", e)));
+                    std::process::exit(1);
+                }
             }
         }
     } else {
@@ -270,14 +274,20 @@ fn main() -> Result<()> {
         }
 
         if let Some(frame) = dl.recv(Some(1000))? {
-            if frame.src() != Some(macaddr) {
-                println!(
-                    "\nreceived data from wrong host: src {} dst {} len {}",
-                    frame.src().unwrap_or_default(),
-                    frame.dst().unwrap_or_default(),
-                    frame.data().len(),
-                );
-                continue;
+            if let Some(macaddr) = macaddr {
+                /*
+                 * We were provided a MAC address by the caller, or we have
+                 * already settled on one based on broadcasts.
+                 */
+                if frame.src() != Some(macaddr) {
+                    println!(
+                        "\nreceived data from wrong host: src {} dst {} len {}",
+                        frame.src().unwrap_or_default(),
+                        frame.dst().unwrap_or_default(),
+                        frame.data().len(),
+                    );
+                    continue;
+                }
             }
 
             let msg = match Message::try_from(&frame) {
@@ -288,6 +298,10 @@ fn main() -> Result<()> {
                 }
             };
 
+            if macaddr.is_none() && !matches!(&msg, Message::Hello(_)) {
+                continue;
+            }
+
             match msg {
                 Message::Hello(msg) => {
                     println!(
@@ -296,6 +310,10 @@ fn main() -> Result<()> {
                         frame.dst().unwrap_or_default(),
                         frame.data().len(),
                     );
+
+                    if macaddr.is_none() {
+                        macaddr = Some(frame.src().unwrap());
+                    }
 
                     println!("msg = {:?}", msg);
 
@@ -308,7 +326,7 @@ fn main() -> Result<()> {
                         Ok(img) => {
                             println!("opened image {:?}: {}", filename, img);
                             dl.send(
-                                macaddr,
+                                macaddr.unwrap(),
                                 &Message::Offer(
                                     img.header.target_size,
                                     img.header.image_size,
@@ -361,7 +379,7 @@ fn main() -> Result<()> {
                                     }
                                     buf.truncate(sz);
                                     dl.send(
-                                        macaddr,
+                                        macaddr.unwrap(),
                                         &Message::Data(offset, buf)
                                             .pack()
                                             .unwrap(),
@@ -371,7 +389,7 @@ fn main() -> Result<()> {
                                     println!("read {} error: {:?}", offset, e);
                                     file = None;
                                     dl.send(
-                                        macaddr,
+                                        macaddr.unwrap(),
                                         &Message::Reset.pack().unwrap(),
                                     )?;
                                     one_boot_check()?;
@@ -385,7 +403,10 @@ fn main() -> Result<()> {
                          * should reset the boot process.
                          */
                         println!("read without open file; reset!");
-                        dl.send(macaddr, &Message::Reset.pack().unwrap())?;
+                        dl.send(
+                            macaddr.unwrap(),
+                            &Message::Reset.pack().unwrap(),
+                        )?;
                         one_boot_check()?;
                     }
                 }
