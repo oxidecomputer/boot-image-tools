@@ -3,6 +3,7 @@ use std::{
     os::unix::prelude::FileExt,
     path::{Path, PathBuf},
     str::FromStr,
+    time::{Duration, Instant},
 };
 
 use anyhow::{bail, Result};
@@ -180,6 +181,12 @@ fn main() -> Result<()> {
     opts.parsing_style(getopts::ParsingStyle::StopAtFirstFree);
     opts.optflag("", "help", "usage information");
     opts.optflag("s", "", "exit after a single boot has been completed");
+    opts.optopt(
+        "t",
+        "",
+        "exit with failure if no broadcast received in N seconds",
+        "SECONDS",
+    );
 
     let prog = "bootserver";
     let usage = |err: Option<&str>| {
@@ -245,17 +252,33 @@ fn main() -> Result<()> {
         }
     };
 
+    let timeout_seconds =
+        a.opt_str("t").map(|s| s.parse::<u64>()).transpose()?;
+    let deadline = timeout_seconds
+        .as_ref()
+        .map(|&n| Instant::now().checked_add(Duration::from_secs(n)).unwrap());
+
     println!("boot server starting on link {}...\n", linkname);
 
     let mut dl = dlpi::Dlpi::open(&linkname)?;
     dl.bind_ethertype(0x1DE0)?;
 
     let mut file: Option<Image> = None;
-    let mut last_read_status = std::time::Instant::now();
+    let mut last_read_status = Instant::now();
     let mut last_read_offset: Option<u64> = None;
 
     loop {
-        let now = std::time::Instant::now();
+        let now = Instant::now();
+
+        if let Some(deadline) = deadline {
+            if now > deadline {
+                bail!(
+                    "boot server gave up after {} seconds without a client",
+                    timeout_seconds.unwrap(),
+                );
+            }
+        }
+
         if let Some(img) = &file {
             if now.checked_duration_since(last_read_status).unwrap().as_secs()
                 > 1
@@ -268,7 +291,7 @@ fn main() -> Result<()> {
                         last_read_offset, pct,
                     );
                     std::io::stdout().flush().unwrap();
-                    last_read_status = std::time::Instant::now();
+                    last_read_status = Instant::now();
                 }
             }
         }
@@ -337,7 +360,7 @@ fn main() -> Result<()> {
                                 .unwrap(),
                             )?;
                             file = Some(img);
-                            last_read_status = std::time::Instant::now();
+                            last_read_status = Instant::now();
                             last_read_offset = None;
                         }
                         Err(e) => {
