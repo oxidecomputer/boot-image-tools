@@ -46,7 +46,9 @@ impl std::fmt::Display for Image {
             .collect::<String>();
         write!(
             f,
-            "image (size {}, target size {}, hash {}, dataset {})",
+            "image (data size {}, image size {}, target size {}, \
+                hash {}, dataset {})",
+            self.header.data_size,
             self.header.image_size,
             self.header.target_size,
             sum,
@@ -129,13 +131,13 @@ impl TryFrom<&dlpi::Frame> for Message {
 impl Message {
     fn pack(&self) -> Result<Vec<u8>> {
         match self {
-            Message::Offer(size, data_size, sha256, dataset) => {
+            Message::Offer(image_size, target_size, sha256, dataset) => {
                 let mut buf = Vec::new();
                 buf.put_u32(MAGIC);
                 buf.put_u32(JMCBOOT_TYPE_OFFER);
                 buf.put_u32(2 * 8 + 32 + 128);
-                buf.put_u64(*size);
-                buf.put_u64(*data_size);
+                buf.put_u64(*target_size);
+                buf.put_u64(*image_size);
                 for b in sha256.iter() {
                     buf.put_u8(*b);
                 }
@@ -348,20 +350,29 @@ fn main() -> Result<()> {
                     match Image::open(&filename) {
                         Ok(img) => {
                             println!("opened image {:?}: {}", filename, img);
-                            dl.send(
-                                macaddr.unwrap(),
-                                &Message::Offer(
-                                    img.header.target_size,
-                                    img.header.image_size,
-                                    img.header.sha256,
-                                    img.header.dataset_name.to_string(),
-                                )
-                                .pack()
-                                .unwrap(),
-                            )?;
-                            file = Some(img);
-                            last_read_status = Instant::now();
-                            last_read_offset = None;
+                            if img
+                                .header
+                                .flags
+                                .contains(diskimage::Flags::COMPRESSED)
+                            {
+                                println!("cannot serve compressed images");
+                                one_boot_check()?;
+                            } else {
+                                dl.send(
+                                    macaddr.unwrap(),
+                                    &Message::Offer(
+                                        img.header.image_size,
+                                        img.header.target_size,
+                                        img.header.sha256,
+                                        img.header.dataset_name.to_string(),
+                                    )
+                                    .pack()
+                                    .unwrap(),
+                                )?;
+                                file = Some(img);
+                                last_read_status = Instant::now();
+                                last_read_offset = None;
+                            }
                         }
                         Err(e) => {
                             file = None;

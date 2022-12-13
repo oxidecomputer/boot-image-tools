@@ -1,13 +1,23 @@
 use anyhow::{bail, Result};
+use bitflags::bitflags;
 use bytes::{Buf, BufMut, BytesMut};
 
-pub const DISK_VERSION: u32 = 1;
+pub const DISK_VERSION: u32 = 2;
 pub const DISK_MAGIC: u32 = 0x1DEB0075;
 pub const DISK_CSUMLEN_SHA256: usize = 32;
 pub const DISK_DATASET_SIZE: usize = 128;
 pub const DISK_HEADER_LENGTH: usize = 4096;
 
+bitflags! {
+    #[derive(Default)]
+    pub struct Flags: u64 {
+        const COMPRESSED = 1;
+    }
+}
+
 pub struct Header {
+    pub flags: Flags,
+    pub data_size: u64,
     pub image_size: u64,
     pub target_size: u64,
     pub dataset_name: String,
@@ -19,6 +29,8 @@ impl Header {
         let mut hdr = BytesMut::new();
         hdr.put_u32_le(DISK_MAGIC);
         hdr.put_u32_le(DISK_VERSION);
+        hdr.put_u64_le(self.flags.bits() as u64);
+        hdr.put_u64_le(self.data_size as u64);
         hdr.put_u64_le(self.image_size as u64);
         hdr.put_u64_le(self.target_size as u64);
 
@@ -72,6 +84,9 @@ impl Header {
             );
         }
 
+        let flags =
+            Flags::from_bits_truncate(input.get_u64_le().try_into().unwrap());
+        let data_size = input.get_u64_le().try_into().unwrap();
         let image_size = input.get_u64_le().try_into().unwrap();
         let target_size = input.get_u64_le().try_into().unwrap();
         if image_size > target_size {
@@ -97,6 +112,17 @@ impl Header {
         }
         let dataset_name = String::from_utf8(s)?;
 
-        Ok(Header { image_size, target_size, dataset_name, sha256 })
+        Ok(Header {
+            flags,
+            data_size,
+            image_size,
+            target_size,
+            dataset_name,
+            sha256,
+        })
+    }
+
+    pub fn checksum_str(&self) -> String {
+        self.sha256.iter().map(|x| format!("{:02x}", x)).collect::<String>()
     }
 }
