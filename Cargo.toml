@@ -2,6 +2,11 @@
 name = "bootserver"
 version = "0.1.0"
 edition = "2021"
+#
+# Report a specific error in the case that the toolchain is too old for
+# let-else:
+#
+rust-version = "1.65.0"
 
 [dependencies]
 anyhow = "1.0.62"
