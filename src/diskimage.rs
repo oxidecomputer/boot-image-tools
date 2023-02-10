@@ -6,6 +6,7 @@ pub const DISK_VERSION: u32 = 2;
 pub const DISK_MAGIC: u32 = 0x1DEB0075;
 pub const DISK_CSUMLEN_SHA256: usize = 32;
 pub const DISK_DATASET_SIZE: usize = 128;
+pub const DISK_IMAGENAME_SIZE: usize = 128;
 pub const DISK_HEADER_LENGTH: usize = 4096;
 
 bitflags! {
@@ -21,7 +22,23 @@ pub struct Header {
     pub image_size: u64,
     pub target_size: u64,
     pub dataset_name: String,
+    pub image_name: String,
     pub sha256: [u8; 32],
+}
+
+trait PaddedString {
+    fn write_padded_string(&mut self, val: &str, len: usize);
+}
+
+impl PaddedString for BytesMut {
+    fn write_padded_string(&mut self, val: &str, len: usize) {
+        let dsb = val.as_bytes();
+        assert!(dsb.len() < len, "string {val:?} is too long");
+        let prev_len = self.len();
+        self.extend_from_slice(dsb);
+        // Since dsb < len, this always appends a 0-terminating byte.
+        self.resize(prev_len + len, 0);
+    }
 }
 
 impl Header {
@@ -39,28 +56,13 @@ impl Header {
             hdr.put_u8(self.sha256[i]);
         }
 
-        let dsb = self.dataset_name.as_bytes();
-        if dsb.len() > DISK_DATASET_SIZE - 1 {
-            bail!("dataset name {:?} is too long", self.dataset_name);
-        }
-        for i in 0..(DISK_DATASET_SIZE - 1) {
-            if i < dsb.len() {
-                hdr.put_u8(dsb[i]);
-            } else {
-                hdr.put_u8(0);
-            }
-        }
-        /*
-         * Ensure the string is null-terminated:
-         */
-        hdr.put_u8(0);
+        hdr.write_padded_string(&self.dataset_name, DISK_DATASET_SIZE);
+        hdr.write_padded_string(&self.image_name, DISK_IMAGENAME_SIZE);
 
         /*
          * Pad the header out to the full 4K block size:
          */
-        while hdr.len() < DISK_HEADER_LENGTH {
-            hdr.put_u8(0);
-        }
+        hdr.resize(DISK_HEADER_LENGTH, 0);
 
         Ok(hdr)
     }
@@ -98,19 +100,21 @@ impl Header {
             sha256[i] = input.get_u8();
         }
 
-        let mut s = Vec::new();
-        loop {
-            if s.len() >= DISK_HEADER_LENGTH {
-                bail!("dataset name string not properly terminated");
-            }
-
-            let b = input.get_u8();
-            if b == 0 {
-                break;
-            }
-            s.push(b);
+        let mut s = vec![0; DISK_DATASET_SIZE];
+        if input.remaining() < s.len() {
+            bail!("insufficient data for dataset name");
         }
-        let dataset_name = String::from_utf8(s)?;
+        input.copy_to_slice(&mut s);
+        let dataset_name =
+            String::from_utf8(s)?.trim_matches(char::from(0)).to_string();
+
+        let mut s = vec![0; DISK_IMAGENAME_SIZE];
+        if input.remaining() < s.len() {
+            bail!("insufficient data for image name");
+        }
+        input.copy_to_slice(&mut s);
+        let image_name =
+            String::from_utf8(s)?.trim_matches(char::from(0)).to_string();
 
         Ok(Header {
             flags,
@@ -118,6 +122,7 @@ impl Header {
             image_size,
             target_size,
             dataset_name,
+            image_name,
             sha256,
         })
     }

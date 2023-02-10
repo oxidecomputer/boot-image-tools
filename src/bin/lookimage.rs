@@ -26,6 +26,7 @@ fn main() -> Result<()> {
     let h = diskimage::Header::from_bytes(&buf)?;
     let hsum = h.checksum_str();
 
+    println!("image name = {}", h.image_name);
     println!("flags = {:#x} ({:?})", h.flags.bits(), h.flags);
     println!("data size = {}", h.data_size);
     println!("image size = {}", h.image_size);

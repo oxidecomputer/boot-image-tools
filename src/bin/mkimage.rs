@@ -15,6 +15,7 @@ fn main() -> Result<()> {
     opts.reqopt("o", "", "output image file with header", "IMAGE");
     opts.optopt("O", "", "output boot_image_csum file", "CSUM_FILE");
     opts.optopt("s", "", "target ramdisk size (MiB)", "MEBIBYTES");
+    opts.optopt("N", "name", "image name", "NAME");
     opts.optflag("z", "compress", "compress image");
 
     let a = opts.parse(std::env::args().skip(1))?;
@@ -32,6 +33,8 @@ fn main() -> Result<()> {
     } else {
         4 * 1024 * 1024 * 1024
     };
+
+    let image_name = a.opt_str("N").unwrap_or_default();
 
     let mut sum = sha2::Sha256::new();
     let mut buf = vec![0u8; 128 * 1024];
@@ -96,6 +99,7 @@ fn main() -> Result<()> {
         image_size,
         target_size,
         dataset_name: "rpool/ROOT/ramdisk".into(), /* XXX */
+        image_name,
         sha256: sum.finalize().into(),
     };
 
