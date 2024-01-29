@@ -1,3 +1,7 @@
+/*
+ * Copyright 2024 Oxide Computer Company
+ */
+
 use std::{
     io::Write,
     os::unix::prelude::FileExt,

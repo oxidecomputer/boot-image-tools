@@ -1,3 +1,7 @@
+/*
+ * Copyright 2024 Oxide Computer Company
+ */
+
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use std::io::prelude::*;

@@ -1,3 +1,7 @@
+/*
+ * Copyright 2024 Oxide Computer Company
+ */
+
 use anyhow::{bail, Result};
 use bitflags::bitflags;
 use bytes::{Buf, BufMut, BytesMut};

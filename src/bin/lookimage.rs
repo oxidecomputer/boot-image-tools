@@ -1,3 +1,7 @@
+/*
+ * Copyright 2024 Oxide Computer Company
+ */
+
 use flate2::read::ZlibDecoder;
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::prelude::FileExt;
