@@ -3,17 +3,24 @@
  */
 
 use std::{
-    io::Write,
+    io::{ErrorKind, Write},
     os::unix::prelude::FileExt,
     path::{Path, PathBuf},
     str::FromStr,
     time::{Duration, Instant},
 };
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use bytes::{Buf, BufMut};
 
-use bootserver::{diskimage, dlpi};
+use bootserver::diskimage;
+
+use pnet::datalink;
+use pnet::packet::ethernet::{
+    EtherType, EthernetPacket, MutableEthernetPacket,
+};
+use pnet::packet::Packet;
+use pnet::util::MacAddr;
 
 enum Message {
     Hello(String),
@@ -63,6 +70,8 @@ impl std::fmt::Display for Image {
 
 const MAGIC: u32 = 0x1DE12345;
 
+const JMCBOOT_ETHERTYPE: EtherType = EtherType(0x1DE0);
+
 const JMCBOOT_TYPE_HELLO: u32 = 0x9001;
 const JMCBOOT_TYPE_OFFER: u32 = 0x9102;
 const JMCBOOT_TYPE_READ: u32 = 0x9003;
@@ -70,11 +79,10 @@ const JMCBOOT_TYPE_DATA: u32 = 0x9104;
 const JMCBOOT_TYPE_FINISHED: u32 = 0x9005;
 const JMCBOOT_TYPE_RESET: u32 = 0x9106;
 
-impl TryFrom<&dlpi::Frame> for Message {
+impl TryFrom<&[u8]> for Message {
     type Error = anyhow::Error;
 
-    fn try_from(frame: &dlpi::Frame) -> Result<Self, Self::Error> {
-        let mut data = frame.data();
+    fn try_from(mut data: &[u8]) -> Result<Self, Self::Error> {
         if data.remaining() < 4 {
             bail!("frame too short");
         }
@@ -182,6 +190,51 @@ impl Message {
     }
 }
 
+struct DataLink {
+    local_mac: MacAddr,
+    tx: Box<dyn datalink::DataLinkSender>,
+    rx: Box<dyn datalink::DataLinkReceiver>,
+}
+
+impl DataLink {
+    fn new(if_name: &str) -> Result<Self> {
+        let ifaces = datalink::interfaces();
+        let iface = ifaces
+            .into_iter()
+            .find(|iface| iface.name == if_name)
+            .ok_or_else(|| anyhow!("Failed to find interface"))?;
+        let Some(local_mac) = iface.mac else {
+            bail!("Link {if_name} has no MAC address?")
+        };
+        let config = datalink::Config {
+            read_timeout: Some(Duration::from_secs(1)),
+            ..Default::default()
+        };
+        let (tx, rx) = match datalink::channel(&iface, config) {
+            Ok(datalink::Channel::Ethernet(tx, rx)) => (tx, rx),
+            Ok(_) => anyhow::bail!("Unexpected datalink type"),
+            Err(e) => anyhow::bail!("Failed to create datalink channel: {e}"),
+        };
+        Ok(DataLink { local_mac, tx, rx })
+    }
+
+    fn send(&mut self, dst: MacAddr, payload: &[u8]) -> Result<()> {
+        let src = self.local_mac;
+        self.tx.build_and_send(
+            1,
+            EthernetPacket::minimum_packet_size() + payload.len(),
+            &mut |buf| {
+                let mut pkt = MutableEthernetPacket::new(buf).unwrap();
+                pkt.set_source(src);
+                pkt.set_destination(dst);
+                pkt.set_ethertype(JMCBOOT_ETHERTYPE);
+                pkt.set_payload(&payload);
+            },
+        );
+        Ok(())
+    }
+}
+
 fn main() -> Result<()> {
     let mut opts = getopts::Options::new();
     opts.parsing_style(getopts::ParsingStyle::StopAtFirstFree);
@@ -236,7 +289,7 @@ fn main() -> Result<()> {
         if macaddr == "any" {
             None
         } else {
-            match dlpi::Address::from_str(macaddr) {
+            match MacAddr::from_str(macaddr) {
                 Ok(addr) => Some(addr),
                 Err(e) => {
                     usage(Some(&format!("MAC address not valid: {}", e)));
@@ -264,10 +317,9 @@ fn main() -> Result<()> {
         .as_ref()
         .map(|&n| Instant::now().checked_add(Duration::from_secs(n)).unwrap());
 
-    println!("boot server starting on link {}...\n", linkname);
+    let mut dl = DataLink::new(linkname)?;
 
-    let mut dl = dlpi::Dlpi::open(&linkname)?;
-    dl.bind_ethertype(0x1DE0)?;
+    println!("boot server starting on link {}...\n", linkname);
 
     let mut file: Option<Image> = None;
     let mut last_read_status = Instant::now();
@@ -302,169 +354,185 @@ fn main() -> Result<()> {
             }
         }
 
-        if let Some(frame) = dl.recv(Some(1000))? {
-            if let Some(macaddr) = macaddr {
-                /*
-                 * We were provided a MAC address by the caller, or we have
-                 * already settled on one based on broadcasts.
-                 */
-                if frame.src() != Some(macaddr) {
-                    println!(
-                        "\nreceived data from wrong host: src {} dst {} len {}",
-                        frame.src().unwrap_or_default(),
-                        frame.dst().unwrap_or_default(),
-                        frame.data().len(),
-                    );
-                    continue;
-                }
-            }
+        let pkt = match dl.rx.next() {
+            Ok(pkt) => pkt,
+            Err(e) if e.kind() == ErrorKind::TimedOut => continue,
+            Err(e) => bail!("Failed to receive packet: {e}"),
+        };
+        let Some(frame) = EthernetPacket::new(pkt) else {
+            eprintln!("Failed to parse {} bytes as Ethernet", pkt.len());
+            continue;
+        };
 
-            let msg = match Message::try_from(&frame) {
-                Ok(msg) => msg,
-                Err(e) => {
-                    println!("frame decode error: {:?}", e);
-                    continue;
-                }
-            };
+        /*
+         * Ignore any packets with the wrong ethertype or that we sent out.
+         */
+        if frame.get_ethertype() != JMCBOOT_ETHERTYPE
+            || frame.get_source() == dl.local_mac
+        {
+            continue;
+        }
 
-            if macaddr.is_none() && !matches!(&msg, Message::Hello(_)) {
+        if let Some(macaddr) = macaddr {
+            /*
+             * We were provided a MAC address by the caller, or we have
+             * already settled on one based on broadcasts.
+             */
+            if frame.get_source() != macaddr {
+                eprintln!(
+                    "\nreceived data from wrong host: src {} dst {} len {}",
+                    frame.get_source(),
+                    frame.get_destination(),
+                    frame.payload().len(),
+                );
                 continue;
             }
+        }
 
-            match msg {
-                Message::Hello(msg) => {
-                    println!(
-                        "\nreceived hello! src {} dst {} len {}",
-                        frame.src().unwrap_or_default(),
-                        frame.dst().unwrap_or_default(),
-                        frame.data().len(),
-                    );
+        let msg = match Message::try_from(frame.payload()) {
+            Ok(msg) => msg,
+            Err(e) => {
+                eprintln!("frame decode error: {e:?}");
+                continue;
+            }
+        };
 
-                    if macaddr.is_none() {
-                        macaddr = Some(frame.src().unwrap());
-                    }
+        if macaddr.is_none() && !matches!(&msg, Message::Hello(_)) {
+            continue;
+        }
 
-                    println!("msg = {:?}", msg);
+        match msg {
+            Message::Hello(msg) => {
+                println!(
+                    "\nreceived hello! src {} dst {} len {}",
+                    frame.get_source(),
+                    frame.get_destination(),
+                    frame.payload().len(),
+                );
 
-                    /*
-                     * When a system says hello, we want to offer the image we
-                     * have available.  If we cannot open the ramdisk file we'll
-                     * just drop the request for now.
-                     */
-                    match Image::open(&filename) {
-                        Ok(img) => {
-                            println!("opened image {:?}: {}", filename, img);
-                            if img
-                                .header
-                                .flags
-                                .contains(diskimage::Flags::COMPRESSED)
-                            {
-                                println!("cannot serve compressed images");
-                                one_boot_check()?;
-                            } else {
-                                dl.send(
-                                    macaddr.unwrap(),
-                                    &Message::Offer(
-                                        img.header.image_size,
-                                        img.header.target_size,
-                                        img.header.sha256,
-                                        img.header.dataset_name.to_string(),
-                                    )
-                                    .pack()
-                                    .unwrap(),
-                                )?;
-                                file = Some(img);
-                                last_read_status = Instant::now();
-                                last_read_offset = None;
-                            }
-                        }
-                        Err(e) => {
-                            file = None;
-                            println!("failed to open {:?}: {:?}", filename, e);
-                            one_boot_check()?;
-                        }
-                    }
+                if macaddr.is_none() {
+                    macaddr = Some(frame.get_source());
                 }
-                Message::Read(offsets) => {
-                    if let Some(img) = &mut file {
-                        for offset in offsets {
-                            let mut buf = vec![0u8; 1024];
-                            let fileoffset = offset
-                                .checked_add(
-                                    diskimage::DISK_HEADER_LENGTH
-                                        .try_into()
-                                        .unwrap(),
+
+                println!("msg = {:?}", msg);
+
+                /*
+                 * When a system says hello, we want to offer the image we
+                 * have available.  If we cannot open the ramdisk file we'll
+                 * just drop the request for now.
+                 */
+                match Image::open(&filename) {
+                    Ok(img) => {
+                        println!("opened image {:?}: {}", filename, img);
+                        if img
+                            .header
+                            .flags
+                            .contains(diskimage::Flags::COMPRESSED)
+                        {
+                            println!("cannot serve compressed images");
+                            one_boot_check()?;
+                        } else {
+                            dl.send(
+                                macaddr.unwrap(),
+                                &Message::Offer(
+                                    img.header.image_size,
+                                    img.header.target_size,
+                                    img.header.sha256,
+                                    img.header.dataset_name.to_string(),
                                 )
-                                .unwrap();
-
-                            last_read_offset =
-                                Some(if let Some(last) = last_read_offset {
-                                    last.max(offset)
-                                } else {
-                                    offset
-                                });
-
-                            /*
-                             * XXX short reads?
-                             */
-                            match img.file.read_at(&mut buf, fileoffset) {
-                                Ok(sz) => {
-                                    if sz < 1024 {
-                                        println!(
-                                            "short read {} at offset {}",
-                                            sz, offset,
-                                        );
-                                    }
-                                    buf.truncate(sz);
-                                    dl.send(
-                                        macaddr.unwrap(),
-                                        &Message::Data(offset, buf)
-                                            .pack()
-                                            .unwrap(),
-                                    )?;
-                                }
-                                Err(e) => {
-                                    println!("read {} error: {:?}", offset, e);
-                                    file = None;
-                                    dl.send(
-                                        macaddr.unwrap(),
-                                        &Message::Reset.pack().unwrap(),
-                                    )?;
-                                    one_boot_check()?;
-                                    break;
-                                }
-                            }
+                                .pack()
+                                .unwrap(),
+                            )
+                            .context("Failed to send Offer")?;
+                            file = Some(img);
+                            last_read_status = Instant::now();
+                            last_read_offset = None;
                         }
-                    } else {
-                        /*
-                         * File not open implies we missed the Hello, and
-                         * should reset the boot process.
-                         */
-                        println!("read without open file; reset!");
-                        dl.send(
-                            macaddr.unwrap(),
-                            &Message::Reset.pack().unwrap(),
-                        )?;
+                    }
+                    Err(e) => {
+                        file = None;
+                        println!("failed to open {:?}: {:?}", filename, e);
                         one_boot_check()?;
                     }
                 }
-                Message::Finished => {
-                    println!(
-                        "\nreceived finished! src {} dst {} len {}",
-                        frame.src().unwrap_or_default(),
-                        frame.dst().unwrap_or_default(),
-                        frame.data().len(),
-                    );
-
-                    file = None;
-                    println!("finished copying!");
-
-                    if one_boot_only {
-                        return Ok(());
-                    }
-                }
-                _ => {}
             }
+            Message::Read(offsets) => {
+                if let Some(img) = &mut file {
+                    for offset in offsets {
+                        let mut buf = vec![0u8; 1024];
+                        let fileoffset = offset
+                            .checked_add(
+                                diskimage::DISK_HEADER_LENGTH
+                                    .try_into()
+                                    .unwrap(),
+                            )
+                            .unwrap();
+
+                        last_read_offset =
+                            Some(if let Some(last) = last_read_offset {
+                                last.max(offset)
+                            } else {
+                                offset
+                            });
+
+                        /*
+                         * XXX short reads?
+                         */
+                        match img.file.read_at(&mut buf, fileoffset) {
+                            Ok(sz) => {
+                                if sz < 1024 {
+                                    println!(
+                                        "short read {} at offset {}",
+                                        sz, offset,
+                                    );
+                                }
+                                buf.truncate(sz);
+                                dl.send(
+                                    macaddr.unwrap(),
+                                    &Message::Data(offset, buf).pack().unwrap(),
+                                )
+                                .context("Failed to send Data")?;
+                            }
+                            Err(e) => {
+                                println!("read {} error: {:?}", offset, e);
+                                file = None;
+                                dl.send(
+                                    macaddr.unwrap(),
+                                    &Message::Reset.pack().unwrap(),
+                                )
+                                .context("Failed to send Reset")?;
+                                one_boot_check()?;
+                                break;
+                            }
+                        }
+                    }
+                } else {
+                    /*
+                     * File not open implies we missed the Hello, and
+                     * should reset the boot process.
+                     */
+                    println!("read without open file; reset!");
+                    dl.send(macaddr.unwrap(), &Message::Reset.pack().unwrap())
+                        .context("Failed to send Reset")?;
+                    one_boot_check()?;
+                }
+            }
+            Message::Finished => {
+                println!(
+                    "\nreceived finished! src {} dst {} len {}",
+                    frame.get_source(),
+                    frame.get_destination(),
+                    frame.payload().len(),
+                );
+
+                file = None;
+                println!("finished copying!");
+
+                if one_boot_only {
+                    return Ok(());
+                }
+            }
+            _ => {}
         }
     }
 }
