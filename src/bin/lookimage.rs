@@ -12,7 +12,8 @@ use sha2::Digest;
 use bootserver::diskimage;
 
 fn main() -> Result<()> {
-    let opts = getopts::Options::new();
+    let mut opts = getopts::Options::new();
+    opts.optflag("s", "skip-checksum", "skip verifying checksum in header");
 
     let a = opts.parse(std::env::args().skip(1))?;
 
@@ -45,6 +46,10 @@ fn main() -> Result<()> {
     }
     if h.flags.contains(diskimage::Flags::COMPRESSED) {
         println!("ratio = {:.2}x", h.image_size as f64 / h.data_size as f64);
+    }
+
+    if a.opt_present("s") {
+        return Ok(());
     }
 
     /*
