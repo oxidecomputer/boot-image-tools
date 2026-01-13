@@ -63,6 +63,18 @@ enum dlpi_addrtype_t {
     DLPI_ADDRTYPE_GROUP,
 }
 
+/// Promiscuous mode at phys level
+const DL_PROMISC_PHYS: c_uint = 0x01;
+
+/// Promiscuous mode at SAP level
+const DL_PROMISC_SAP: c_uint = 0x02;
+
+/// Promiscuous mode for multicast
+const DL_PROMISC_MULTI: c_uint = 0x03;
+
+/// Above promiscuous modes only enabled for rx
+const DL_PROMISC_RX_ONLY: c_uint = 0x04;
+
 #[link(name = "dlpi")]
 extern "C" {
     fn dlpi_open(
@@ -93,6 +105,8 @@ extern "C" {
         msglen: usize,
         sendp: *const dlpi_sendinfo_t,
     ) -> c_int;
+    fn dlpi_promiscon(dhp: *mut dlpi_handle_t, promisc: c_uint) -> c_int;
+    fn dlpi_promiscoff(dhp: *mut dlpi_handle_t, promisc: c_uint) -> c_int;
 }
 
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
@@ -268,6 +282,19 @@ impl Dlpi {
         };
         if r != DLPI_SUCCESS {
             bail!("send failed ({})", r);
+        }
+        Ok(())
+    }
+
+    /// Enables promiscuous mode (rx only) on the DLPI handle
+    pub fn promisc_on(&mut self) -> Result<()> {
+        let r = unsafe { dlpi_promiscon(self.handle, DL_PROMISC_RX_ONLY) };
+        if r != DLPI_SUCCESS {
+            bail!("failed to set DL_PROMISC_RX_ONLY ({r})");
+        }
+        let r = unsafe { dlpi_promiscon(self.handle, DL_PROMISC_PHYS) };
+        if r != DLPI_SUCCESS {
+            bail!("failed to set DL_PROMISC_PHYS ({r})");
         }
         Ok(())
     }
